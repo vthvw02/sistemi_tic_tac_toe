@@ -3,18 +3,22 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <pcap.h>
-#include <fcntl.h>
 #include <time.h>
 #include <errno.h>
+#include <signal.h>
+#include <pcap.h>
 
+void sigHandler(int sig);
+void sigHandlerFiglio(int sig);
+
+giocatore_t user;				//struttura contiene i dati del giocatori
+pcap_t *interface;				//interfaccia di rete
+pid_t pID;						//serve per salvare il pid del processo figlio
+int status=0;
 
 int main(int argc,char **argv){
 	
 	FILE* fp;
-	pid_t pID;						//serve per salvare il pid del processo figlio
-	giocatore_t user;				//struttura contiene i dati del giocatori
-	pcap_t *interface;				//interfaccia di rete
 	char errbuf[PCAP_ERRBUF_SIZE];	//buffer errori per pcap
 	char nome[100];					//variabile d'appoggio per salvare il nome utente
 	int res;						//variabile appoggio risultato letture pacchetti
@@ -47,9 +51,158 @@ int main(int argc,char **argv){
 		perror("errore creazione del processo figlio : ");
 		return -1;
 	}
+	
 	//processo FIGLIO
 	if(!pID){
 		//lettura paccheti
+		int scelta=1,sceltaGiocatore=-1,x,y;
+		unsigned int numeroGiocatori,i;
+		char choice, tabellaTris[3][3],richiestaAccettata;
+		giocatore_t *players;
+		int turno=0;
+		char whoWin;
+		
+		signal(SIGUSR1,sigHandlerFiglio);
+		
+		settaTabella(tabellaTris);
+		//INIZIO PARTITA
+		fputs("[1]->partita\n",stdout);
+		fputs("[2]->esci\n",stdout);
+		fscanf_ottimizzata(stdin,"%d", &scelta);
+		
+		if(scelta==1){
+			//io invio la richiesta
+			numeroGiocatori=0;
+			//prova l'invio del pacchetto richiesta presenza per 15 volte
+			while(invioRichiestaPresenza(interface,user.mac)!=0){
+				i++;
+				if(i>=15){
+					fputs("\nerrore nell'invio del pacchetto della presenza sulla rete\n", stderr);
+					fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
+					if(choice=='s' || choice=='S')
+						i=0;
+					else{
+						//esce e killa il figlio
+						_exit(-1);
+					}
+				}
+			}
+			
+			//riempio array giocatori
+			salvaGiocatori(&players,&numeroGiocatori);
+			if(numeroGiocatori==0){
+				fputs("nessun giocatore sulla rete\n",stderr);
+				_exit(-1);
+			}
+			//stampo i giocatori sulla rete
+			for(i=0;i<numeroGiocatori;i++){
+				fprintf(stdout,"[%i] -> %s \n",i,players[i].username);
+			}
+			
+			//scelta avversario
+			do{
+				fputs_and_fscanf(stdout,stdin,"inserisci il numero del giocatore da sfidare:  ","%i",  &sceltaGiocatore);
+			}while(sceltaGiocatore<0 || sceltaGiocatore>=numeroGiocatori);
+			//invio la richiesta di giocare al avversaio scelto
+			while(invioRichiestaPartita(interface,user, players[sceltaGiocatore].mac) !=0){
+				i++;
+				if(i>=15){
+					fputs("\nerrore nell'invio della richiesta di giocare\n", stderr);
+					fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
+					if(choice=='s' || choice=='S')
+						i=0;
+					else{
+						_exit(-1);
+					}
+				}
+			}
+			//se l'avversario ha accettato la nostra richiesta
+			if(controlloRispostaPartite()){
+				status=1;
+				//finche non si vince o si finisce in parità
+				while(turno<9){
+					//dopo 6 mosse qualcuno può vincere -> controllo
+					if((whoWin = controlloVincita(tabellaTris))!=' '){
+						fprintf(stdout,"%s\n",(whoWin=='X')?"hai vinto :)":"hai perso :(");
+						_exit(0);
+					}
+					clear_screen;
+					stampaTabella(tabellaTris);
+					//inserisco mossa e controllo
+					do{
+						fputs_and_fscanf(stdout,stdin,"inserisci la [x] e la [y] della tua mossa\n","%1i%1i", &x,&y);		//salvo la mia mossa
+					}while(!controlloDatiXeY(tabellaTris,x,y));		
+					//invio la mossa all'avversario
+					while(invioMessaggiPartita(interface,user.mac, players[sceltaGiocatore].mac,x,y) !=0){
+						i++;
+						if(i>=15){
+							fputs("\nerrore nell'invio del pacchetto di gioco\n", stderr);
+							fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
+							if(choice=='s' || choice=='S')
+								i=0;
+							else{
+								_exit(-1);
+							}
+						}
+					}
+					
+					clear_screen;
+					aggiornaTabella(tabellaTris,x,y,'X');
+					stampaTabella(tabellaTris);
+					turno++;
+					
+					if(turno>=9){
+						//dopo 6 mosse qualcuno può vincere -> controllo
+						if((whoWin = controlloVincita(tabellaTris))!=' '){
+							fprintf(stdout,"%s\n",(whoWin=='X')?"hai vinto :)":"hai perso :(");
+							_exit(0);	//esce e killa il figlio
+						}
+						continue;
+					}
+					
+					//dopo 6 mosse qualcuno può vincere -> controllo
+					if((whoWin = controlloVincita(tabellaTris))!=' '){
+						fprintf(stdout,"%s\n",(whoWin=='X')?"hai vinto :)":"hai perso :(");
+						_exit(0);	//esce e killa il figlio
+					}
+					
+					//turno avversario
+					fputs("in attesa mossa dell'avversario\n",stdout);
+					//lettura pipe risposta dati partita salvati in x e y
+					remove("temp");
+					if(rispostaPartitaXeY(&x,&y)==-1){
+						fputs("l'avversario si e' ritirato\n",stdout);
+						_exit(0);	//esce e killa il figlio
+					}
+					
+					clear_screen;
+					aggiornaTabella(tabellaTris,x,y,'O');
+					stampaTabella(tabellaTris);
+					turno++;
+				}
+				clear_screen;
+				stampaTabella(tabellaTris);
+				printf("turno : %i\n",turno);
+				fputs("pareggio :/\n", stdout);
+				_exit(0);				
+			}else{
+				//termina il gioco
+				fputs("l'avversario non ha accettato la richiesta\n",stdout);
+				fputs_and_fscanf(stdout,stdin,"premere invio per continuare...\n","%c", choice);
+				_exit(1);
+			}
+		//acetto la richiesta
+		}else{
+			_exit(1);	
+		}
+		
+	}
+	//processo PADRE
+	else{
+		
+		signal(SIGINT,sigHandler);
+		signal(SIGCHLD,sigHandler);
+		
 		while((res = pcap_next_ex(interface, &header, &pkt_data)) >= 0){
 			if(res == 0)
 				continue;
@@ -63,7 +216,7 @@ int main(int argc,char **argv){
 				messaggio.mac[4]=pkt_data[10];
 				messaggio.mac[5]=pkt_data[11];
 				//controllo se il messaggio è broadcast
-				if(isBroadCast(pkt_data)){										
+				if(isBroadCast(pkt_data)){
 					u_char pacchettoRisposta[31];
 					//mac destinatario
 					pacchettoRisposta[0] = messaggio.mac[0];
@@ -111,6 +264,7 @@ int main(int argc,char **argv){
 						fp=fopen("temp","wb");
 						fwrite(&messaggio,sizeof(mesg_t),1,fp);
 						fclose(fp);
+						kill(pID,SIGUSR1);
 					}
 					//controllo se vuole giocare o no -> salvo la scelta avversaria
 					else if(messaggio.modalita==rispostaPartita){
@@ -138,224 +292,114 @@ int main(int argc,char **argv){
 			exit(-1);
 		}
 	}
-	//processo PADRE
-	else{
-		int scelta=1,sceltaGiocatore=-1,x,y;
-		unsigned int numeroGiocatori,i;
-		char choice, tabellaTris[3][3],richiestaAccettata;
-		giocatore_t *players;
-		int turno=0;
-		char whoWin;
-		settaTabella(tabellaTris);
-		//INIZIO PARTITA
-		fputs("[1]->partita\n",stdout);
-		fputs("[2]->ascolta\n",stdout);
-		fputs("[3]->esci\n",stdout);
-		fscanf_ottimizzata(stdin,"%d", &scelta);
-		
-		if(scelta==1){
-			//io invio la richiesta
-			numeroGiocatori=0;
-			//prova l'invio del pacchetto richiesta presenza per 15 volte
-			while(invioRichiestaPresenza(interface,user.mac)!=0){
-				i++;
-				if(i>=15){
-					fputs("\nerrore nell'invio del pacchetto della presenza sulla rete\n", stderr);
-					fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
-					if(choice=='s' || choice=='S')
-						i=0;
-					else{
-						//esce e killa il figlio
-						kill(pID,9);
-						_exit(-1);
-					}
-				}
-			}
-			
-			//riempio array giocatori
-			salvaGiocatori(&players,&numeroGiocatori);
-			if(numeroGiocatori==0){
-				fputs("nessun giocatore sulla rete\n",stderr);
-				kill(pID,9);
-				_exit(-1);
-			}
-			//stampo i giocatori sulla rete
-			for(i=0;i<numeroGiocatori;i++){
-				fprintf(stdout,"[%i] -> %s \n",i,players[i].username);
-			}
-			
-			//scelta avversario
-			do{
-				fputs_and_fscanf(stdout,stdin,"inserisci il numero del giocatore da sfidare:  ","%i",  &sceltaGiocatore);
-			}while(sceltaGiocatore<0 || sceltaGiocatore>=numeroGiocatori);
-			//invio la richiesta di giocare al avversaio scelto
-			while(invioRichiestaPartita(interface,user, players[sceltaGiocatore].mac) !=0){
-				i++;
-				if(i>=15){
-					fputs("\nerrore nell'invio della richiesta di giocare\n", stderr);
-					fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
-					if(choice=='s' || choice=='S')
-						i=0;
-					else{
-						kill(pID,9);
-						_exit(-1);
-					}
-				}
-			}
-			//se l'avversario ha accettato la nostra richiesta
-			if(controlloRispostaPartite()){
-				//finche non si vince o si finisce in parità
-				while(turno<9){
-					//dopo 6 mosse qualcuno può vincere -> controllo
-					if((whoWin = controlloVincita(tabellaTris))!=' '){
-						fprintf(stdout,"%s\n",(whoWin=='X')?"hai vinto :)":"hai perso :(");
-						kill(pID,9);
-						_exit(0);
-					}
-					clear_screen;
-					stampaTabella(tabellaTris);
-					//inserisco mossa e controllo
-					do{
-						fputs_and_fscanf(stdout,stdin,"inserisci la [x] e la [y] della tua mossa\n","%1i%1i", &x,&y);		//salvo la mia mossa
-					}while(!controlloDatiXeY(tabellaTris,x,y));		
-					//invio la mossa all'avversario
-					while(invioMessaggiPartita(interface,user.mac, players[sceltaGiocatore].mac,x,y) !=0){
-						i++;
-						if(i>=15){
-							fputs("\nerrore nell'invio del pacchetto di gioco\n", stderr);
-							fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
-							if(choice=='s' || choice=='S')
-								i=0;
-							else{
-								kill(pID,9);
-								_exit(-1);
-							}
-						}
-					}
-					
-					clear_screen;
-					aggiornaTabella(tabellaTris,x,y,'X');
-					stampaTabella(tabellaTris);
-					turno++;
-					if(turno>=9){
-						continue;
-					}
-					
-					//dopo 6 mosse qualcuno può vincere -> controllo
-					if((whoWin = controlloVincita(tabellaTris))!=' '){
-						fprintf(stdout,"%s\n",(whoWin=='X')?"hai vinto :)":"hai perso :(");
-						kill(pID,9);
-						_exit(0);	//esce e killa il figlio
-					}
-					
-					//turno avversario
-					fputs("in attesa mossa dell'avversario\n",stdout);
-					//lettura pipe risposta dati partita salvati in x e y
-					remove("temp");
-					if(rispostaPartitaXeY(&x,&y)==-1){
-						fputs("l'avversario si e' ritirato\n",stdout);
-						kill(pID,9);
-						_exit(0);	//esce e killa il figlio
-					}
-					
-					clear_screen;
-					aggiornaTabella(tabellaTris,x,y,'O');
-					stampaTabella(tabellaTris);
-					turno++;
-				}
-				clear_screen;
-				stampaTabella(tabellaTris);
-				printf("turno : %i\n",turno);
-				fputs("pareggio :/\n", stdout);
-				kill(pID,9);
-				_exit(0);				
-			}else{
-				//termina il gioco
-				kill(pID,9);
-				_exit(1);	
-				fputs("l'avversario non ha accettato la richiesta\n",stdout);
-				fputs_and_fscanf(stdout,stdin,"premere invio per continuare...\n","%c", choice);
-				clear_screen;
-			}
-		//acetto la richiesta
-		}else if(scelta==2){
-			if(controlloRichiestePartite(&players)=='n'){
-				fputs("nessuno ti ha mandato una richiesta\n",stdout);
-				kill(pID,9);
-				_exit(1);
-			}
-			sceltaGiocatore=0;
-			inviaRispostaPartecipaAllaPartita(interface,user.mac, players[sceltaGiocatore].mac,TRUE);
-			//finche non si vince o si finisce in parità
-			while(turno<9){
-				
-				//dopo 6 mosse qualcuno può vincere -> controllo
-				if((whoWin = controlloVincita(tabellaTris))!=' '){
-					fprintf(stdout,"%s\n",(whoWin=='O')?"hai vinto :)":"hai perso :(");
-					kill(pID,9);
-					_exit(0);
-				}
-				
-				clear_screen;
-				stampaTabella(tabellaTris);
-				fputs("in attesa mossa dell'avversario\n",stdout);
-				
-				//lettura pipe risposta dati partita salvati in x e y
-				remove("temp");
-				if(rispostaPartitaXeY(&x,&y)==-1){
-					fputs("l'avversario si e' ritirato\n",stdout);
-					kill(pID,9);
-					_exit(0);
-				}
-				
-				clear_screen;
-				aggiornaTabella(tabellaTris,x,y,'X');
-				stampaTabella(tabellaTris);
-				turno++;
-				if(turno>=9){
-					continue;
-				}
-				
-				//dopo 6 mosse qualcuno può vincere -> controllo
-				if((whoWin = controlloVincita(tabellaTris))!=' '){
-					fprintf(stdout,"%s\n",(whoWin=='O')?"hai vinto :)":"hai perso :(");
-					kill(pID,9);
-					_exit(0);
-				}
-				//inserisco la mia mossa e controllo che la mossa sia corretta
-				do{
-					fputs_and_fscanf(stdout,stdin,"inserisci la [x] e la [y] della tua mossa\n","%1i%1i", &x,&y);		//salvo la mia mossa
-				}while(!controlloDatiXeY(tabellaTris,x,y));
-				//invio la mia mossa all'avversario
-				while(invioMessaggiPartita(interface,user.mac, players[sceltaGiocatore].mac,x,y) !=0){
-					i++;
-					if(i>=15){
-						fputs("\nerrore nell'invio del pacchetto di gioco\n", stderr);
-						fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
-						if(choice=='s' || choice=='S')
-							i=0;
-						else{
-							kill(pID,9);
-							_exit(-1);
-						}
-					}
-				}
-				clear_screen;
-				aggiornaTabella(tabellaTris,x,y,'O');
-				stampaTabella(tabellaTris);
-				turno++;
-			}
-			clear_screen;
-			stampaTabella(tabellaTris);
-			printf("turno : %i\n",turno);
-			fputs("pareggio :/\n", stdout);
-			kill(pID,9);
-			_exit(0);
-		}else{
-			kill(pID,9);
-			_exit(1);	
-		}
-	}
 	pauseScreen;
 	return 0;
 }
+
+void sigHandler(int sig){
+	if(pID){
+		if(sig==SIGCHLD){
+			remove("temp");
+			_exit(-1);
+		}else if(sig==SIGINT){
+			fputs("\nthis is sad :(\nByee\n\n",stderr);
+			kill(pID,9);
+			remove("temp");
+			_exit(-1);
+		}
+	}
+}
+
+void partitaPassiva(){
+	int scelta=1,sceltaGiocatore=-1,x,y;
+	unsigned int numeroGiocatori,i;
+	char choice, tabellaTris[3][3],richiestaAccettata;
+	giocatore_t *players;
+	int turno=0;
+	char whoWin;
+	
+	settaTabella(tabellaTris);
+	
+	if(controlloRichiestePartite(&players)=='n'){
+		fputs("non hai accettato la richiesta\n",stdout);
+		_exit(-1);
+	}
+	
+	sceltaGiocatore=0;
+	inviaRispostaPartecipaAllaPartita(interface,user.mac, players[sceltaGiocatore].mac,TRUE);
+	//finche non si vince o si finisce in parità
+	while(turno<9){
+		
+		//dopo 6 mosse qualcuno può vincere -> controllo
+		if((whoWin = controlloVincita(tabellaTris))!=' '){
+			fprintf(stdout,"%s\n",(whoWin=='O')?"hai vinto :)":"hai perso :(");
+			_exit(0);
+		}
+		
+		clear_screen;
+		stampaTabella(tabellaTris);
+		fputs("in attesa mossa dell'avversario\n",stdout);
+		
+		//lettura pipe risposta dati partita salvati in x e y
+		remove("temp");
+		if(rispostaPartitaXeY(&x,&y)==-1){
+			fputs("l'avversario si e' ritirato\n",stdout);
+			_exit(0);
+		}
+		
+		clear_screen;
+		aggiornaTabella(tabellaTris,x,y,'X');
+		stampaTabella(tabellaTris);
+		turno++;
+		if(turno>=9){
+			//dopo 6 mosse qualcuno può vincere -> controllo
+			if((whoWin = controlloVincita(tabellaTris))!=' '){
+				fprintf(stdout,"%s\n",(whoWin=='O')?"hai vinto :)":"hai perso :(");
+				_exit(0);	//esce e killa il figlio
+			}
+			continue;
+		}
+		
+		//dopo 6 mosse qualcuno può vincere -> controllo
+		if((whoWin = controlloVincita(tabellaTris))!=' '){
+			fprintf(stdout,"%s\n",(whoWin=='O')?"hai vinto :)":"hai perso :(");
+			_exit(0);
+		}
+		//inserisco la mia mossa e controllo che la mossa sia corretta
+		do{
+			fputs_and_fscanf(stdout,stdin,"inserisci la [x] e la [y] della tua mossa\n","%1i%1i", &x,&y);		//salvo la mia mossa
+		}while(!controlloDatiXeY(tabellaTris,x,y));
+		//invio la mia mossa all'avversario
+		while(invioMessaggiPartita(interface,user.mac, players[sceltaGiocatore].mac,x,y) !=0){
+			i++;
+			if(i>=15){
+				fputs("\nerrore nell'invio del pacchetto di gioco\n", stderr);
+				fputs_and_fscanf(stdout,stdin,"vuoi riprovare? [S/n] \n","%c", choice);
+				if(choice=='s' || choice=='S')
+					i=0;
+				else{
+					_exit(-1);
+				}
+			}
+		}
+		clear_screen;
+		aggiornaTabella(tabellaTris,x,y,'O');
+		stampaTabella(tabellaTris);
+		turno++;
+	}
+	clear_screen;
+	stampaTabella(tabellaTris);
+	printf("turno : %i\n",turno);
+	fputs("pareggio :/\n", stdout);
+	_exit(0);
+}
+
+void sigHandlerFiglio(int sig){
+	if(sig==SIGUSR1){
+		if(!status){
+			partitaPassiva();
+		}
+	}
+}
+
+

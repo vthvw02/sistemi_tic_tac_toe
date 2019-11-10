@@ -304,14 +304,14 @@ char controlloRichiestePartite(giocatore_t* *players){
 	size_t nread;
 	FILE *fp;
 	
-	while(adesso<(inizio+300)){
+	while(adesso<(inizio+7)){
 		messaggio.modalita=partita;
 		fp=NULL;
 		fp=fopen("temp","rb");
 		if(fp!=NULL){
 			fread(&messaggio,sizeof(mesg_t),1,fp);
 			if(messaggio.modalita==richiestaPartita){
-				fprintf(stdout,"accettare la richiesta di %s [S/n] :\n",messaggio.nomeUtente);
+				fprintf(stdout,"\naccettare la richiesta di %s [S/n] :\n",messaggio.nomeUtente);
 				fscanf_ottimizzata(stdin,"%c",&scelta);
 				//salvo il mac
 				if(scelta=='S'||scelta=='s'){
